@@ -1,0 +1,244 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional, Dict
+import nltk
+from nltk.tokenize import word_tokenize
+from nltk.corpus import stopwords
+import numpy as np
+import os
+from dotenv import load_dotenv
+import requests
+
+# Download NLTK data
+nltk.download('punkt')
+nltk.download('stopwords')
+
+# Load environment variables
+load_dotenv()
+
+app = FastAPI(title="Image Search Recommendation Engine")
+
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Unsplash API configuration
+UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY")
+if not UNSPLASH_ACCESS_KEY:
+    raise ValueError("UNSPLASH_ACCESS_KEY not found in environment variables")
+
+UNSPLASH_API_URL = "https://api.unsplash.com"
+
+class SearchQuery(BaseModel):
+    query: str
+    search_type: str  # "images" or "collections"
+
+class ImageUrls(BaseModel):
+    raw: str
+    full: str
+    regular: str
+    small: str
+    thumb: str
+
+class UserProfile(BaseModel):
+    id: str
+    username: str
+    name: str
+    portfolio_url: Optional[str]
+    profile_image: Dict[str, str]
+    links: Dict[str, str]
+
+class Image(BaseModel):
+    id: str
+    created_at: str
+    width: int
+    height: int
+    color: str
+    likes: int
+    description: Optional[str]
+    alt_description: Optional[str]
+    urls: ImageUrls
+    user: UserProfile
+    tags: List[Dict[str, str]] = []
+
+class Collection(BaseModel):
+    id: str
+    title: str
+    description: Optional[str]
+    total_photos: int
+    private: bool
+    tags: List[Dict[str, str]] = []
+    preview_photos: List[Dict[str, Dict[str, str]]] = []
+    user: UserProfile
+
+def search_unsplash_images(query: str, per_page: int = 100) -> List[Image]:
+    """Search images on Unsplash API."""
+    headers = {
+        "Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"
+    }
+    
+    response = requests.get(
+        f"{UNSPLASH_API_URL}/search/photos",
+        headers=headers,
+        params={
+            "query": query,
+            "per_page": per_page,
+            "content_filter": "high"
+        }
+    )
+    
+    if response.status_code != 200:
+        raise HTTPException(status_code=response.status_code, detail="Failed to fetch images from Unsplash")
+    
+    data = response.json()
+    return [Image(**result) for result in data["results"]]
+
+def search_unsplash_collections(query: str, per_page: int = 20) -> List[Collection]:
+    """Search collections on Unsplash API."""
+    headers = {
+        "Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"
+    }
+    
+    response = requests.get(
+        f"{UNSPLASH_API_URL}/search/collections",
+        headers=headers,
+        params={
+            "query": query,
+            "per_page": per_page
+        }
+    )
+    
+    if response.status_code != 200:
+        raise HTTPException(status_code=response.status_code, detail="Failed to fetch collections from Unsplash")
+    
+    data = response.json()
+    return [Collection(**result) for result in data["results"]]
+
+def preprocess_text(text: str) -> List[str]:
+    """Preprocess text by tokenizing and removing stopwords."""
+    if not text:
+        return []
+    tokens = word_tokenize(text.lower())
+    stop_words = set(stopwords.words('english'))
+    return [token for token in tokens if token.isalnum() and token not in stop_words]
+
+def calculate_convergence_score(query_tokens: List[str], item: Image | Collection) -> float:
+    """Calculate the convergence score between query and item metadata."""
+    # For images, use description, alt_description, and tags
+    if isinstance(item, Image):
+        item_text = " ".join(filter(None, [
+            item.description,
+            item.alt_description,
+            *[tag["title"] for tag in item.tags]
+        ]))
+    # For collections, use title, description, and tags
+    else:
+        item_text = " ".join(filter(None, [
+            item.title,
+            item.description,
+            *[tag["title"] for tag in item.tags]
+        ]))
+    
+    item_tokens = preprocess_text(item_text)
+    query_set = set(query_tokens)
+    item_set = set(item_tokens)
+    
+    # Calculate Jaccard similarity
+    intersection = len(query_set.intersection(item_set))
+    union = len(query_set.union(item_set))
+    
+    return intersection / union if union > 0 else 0
+
+@app.post("/api/search/images")
+async def search_images(query: SearchQuery) -> List[Image]:
+    """Search for images based on natural language query."""
+    if query.search_type != "images":
+        raise HTTPException(status_code=400, detail="Invalid search type for image search")
+    
+    try:
+        # Get images from Unsplash
+        images = search_unsplash_images(query.query)
+        
+        # Calculate relevance scores
+        query_tokens = preprocess_text(query.query)
+        scored_images = [
+            (image, calculate_convergence_score(query_tokens, image))
+            for image in images
+        ]
+        
+        # Sort by score in descending order
+        sorted_images = sorted(scored_images, key=lambda x: x[1], reverse=True)
+        return [image for image, _ in sorted_images]
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/search/collections")
+async def search_collections(query: SearchQuery) -> List[Collection]:
+    """Search for collections based on natural language query."""
+    if query.search_type != "collections":
+        raise HTTPException(status_code=400, detail="Invalid search type for collection search")
+    
+    try:
+        # Get collections from Unsplash
+        collections = search_unsplash_collections(query.query)
+        
+        # Calculate relevance scores
+        query_tokens = preprocess_text(query.query)
+        scored_collections = [
+            (collection, calculate_convergence_score(query_tokens, collection))
+            for collection in collections
+        ]
+        
+        # Sort by score in descending order
+        sorted_collections = sorted(scored_collections, key=lambda x: x[1], reverse=True)
+        return [collection for collection, _ in sorted_collections]
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/images/{image_id}")
+async def get_image(image_id: str) -> Image:
+    """Get image details by ID."""
+    headers = {
+        "Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"
+    }
+    
+    response = requests.get(
+        f"{UNSPLASH_API_URL}/photos/{image_id}",
+        headers=headers
+    )
+    
+    if response.status_code == 404:
+        raise HTTPException(status_code=404, detail="Image not found")
+    elif response.status_code != 200:
+        raise HTTPException(status_code=response.status_code, detail="Failed to fetch image from Unsplash")
+    
+    result = response.json()
+    return Image(**result)
+
+@app.get("/api/collections/{collection_id}")
+async def get_collection(collection_id: str) -> Collection:
+    """Get collection details by ID."""
+    headers = {
+        "Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"
+    }
+    
+    response = requests.get(
+        f"{UNSPLASH_API_URL}/collections/{collection_id}",
+        headers=headers
+    )
+    
+    if response.status_code == 404:
+        raise HTTPException(status_code=404, detail="Collection not found")
+    elif response.status_code != 200:
+        raise HTTPException(status_code=response.status_code, detail="Failed to fetch collection from Unsplash")
+    
+    result = response.json()
+    return Collection(**result) 
