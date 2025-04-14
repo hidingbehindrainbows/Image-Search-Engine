@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Union
 import nltk
 from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords
@@ -9,6 +9,9 @@ import numpy as np
 import os
 from dotenv import load_dotenv
 import requests
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+import torch
 
 # Download NLTK data
 nltk.download('punkt')
@@ -16,6 +19,9 @@ nltk.download('stopwords')
 
 # Load environment variables
 load_dotenv()
+
+# Initialize the sentence transformer model
+model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
 
 app = FastAPI(title="Image Search Recommendation Engine")
 
@@ -77,6 +83,38 @@ class Collection(BaseModel):
     preview_photos: List[Dict[str, Dict[str, str]]] = []
     user: UserProfile
 
+def get_semantic_similarity(query: str, items: List[Union[Image, Collection]]) -> List[float]:
+    """Calculate semantic similarity between query and items using BERT embeddings."""
+    # Get query embedding
+    query_embedding = model.encode([query], convert_to_tensor=True)
+    
+    # Get item embeddings
+    item_texts = []
+    for item in items:
+        if isinstance(item, Image):
+            text = " ".join(filter(None, [
+                item.description,
+                item.alt_description,
+                *[tag["title"] for tag in item.tags]
+            ]))
+        else:
+            text = " ".join(filter(None, [
+                item.title,
+                item.description,
+                *[tag["title"] for tag in item.tags]
+            ]))
+        item_texts.append(text if text.strip() else "no description available")
+    
+    item_embeddings = model.encode(item_texts, convert_to_tensor=True)
+    
+    # Calculate cosine similarities
+    similarities = cosine_similarity(
+        query_embedding.cpu().numpy(),
+        item_embeddings.cpu().numpy()
+    )[0]
+    
+    return similarities.tolist()
+
 def search_unsplash_images(query: str, per_page: int = 100) -> List[Image]:
     """Search images on Unsplash API."""
     headers = {
@@ -120,44 +158,9 @@ def search_unsplash_collections(query: str, per_page: int = 20) -> List[Collecti
     data = response.json()
     return [Collection(**result) for result in data["results"]]
 
-def preprocess_text(text: str) -> List[str]:
-    """Preprocess text by tokenizing and removing stopwords."""
-    if not text:
-        return []
-    tokens = word_tokenize(text.lower())
-    stop_words = set(stopwords.words('english'))
-    return [token for token in tokens if token.isalnum() and token not in stop_words]
-
-def calculate_convergence_score(query_tokens: List[str], item: Image | Collection) -> float:
-    """Calculate the convergence score between query and item metadata."""
-    # For images, use description, alt_description, and tags
-    if isinstance(item, Image):
-        item_text = " ".join(filter(None, [
-            item.description,
-            item.alt_description,
-            *[tag["title"] for tag in item.tags]
-        ]))
-    # For collections, use title, description, and tags
-    else:
-        item_text = " ".join(filter(None, [
-            item.title,
-            item.description,
-            *[tag["title"] for tag in item.tags]
-        ]))
-    
-    item_tokens = preprocess_text(item_text)
-    query_set = set(query_tokens)
-    item_set = set(item_tokens)
-    
-    # Calculate Jaccard similarity
-    intersection = len(query_set.intersection(item_set))
-    union = len(query_set.union(item_set))
-    
-    return intersection / union if union > 0 else 0
-
 @app.post("/api/search/images")
 async def search_images(query: SearchQuery) -> List[Image]:
-    """Search for images based on natural language query."""
+    """Search for images based on natural language query using semantic search."""
     if query.search_type != "images":
         raise HTTPException(status_code=400, detail="Invalid search type for image search")
     
@@ -165,15 +168,13 @@ async def search_images(query: SearchQuery) -> List[Image]:
         # Get images from Unsplash
         images = search_unsplash_images(query.query)
         
-        # Calculate relevance scores
-        query_tokens = preprocess_text(query.query)
-        scored_images = [
-            (image, calculate_convergence_score(query_tokens, image))
-            for image in images
-        ]
+        # Calculate semantic similarities
+        similarities = get_semantic_similarity(query.query, images)
         
-        # Sort by score in descending order
+        # Sort images by similarity score
+        scored_images = list(zip(images, similarities))
         sorted_images = sorted(scored_images, key=lambda x: x[1], reverse=True)
+        
         return [image for image, _ in sorted_images]
     
     except Exception as e:
@@ -181,7 +182,7 @@ async def search_images(query: SearchQuery) -> List[Image]:
 
 @app.post("/api/search/collections")
 async def search_collections(query: SearchQuery) -> List[Collection]:
-    """Search for collections based on natural language query."""
+    """Search for collections based on natural language query using semantic search."""
     if query.search_type != "collections":
         raise HTTPException(status_code=400, detail="Invalid search type for collection search")
     
@@ -189,15 +190,13 @@ async def search_collections(query: SearchQuery) -> List[Collection]:
         # Get collections from Unsplash
         collections = search_unsplash_collections(query.query)
         
-        # Calculate relevance scores
-        query_tokens = preprocess_text(query.query)
-        scored_collections = [
-            (collection, calculate_convergence_score(query_tokens, collection))
-            for collection in collections
-        ]
+        # Calculate semantic similarities
+        similarities = get_semantic_similarity(query.query, collections)
         
-        # Sort by score in descending order
+        # Sort collections by similarity score
+        scored_collections = list(zip(collections, similarities))
         sorted_collections = sorted(scored_collections, key=lambda x: x[1], reverse=True)
+        
         return [collection for collection, _ in sorted_collections]
     
     except Exception as e:
