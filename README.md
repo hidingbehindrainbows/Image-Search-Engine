@@ -41,8 +41,7 @@ A natural language search recommendation engine for images and collections using
 ### 1. Clone the Repository
 
 ```bash
-git clone <repository-url>
-cd <repository-name>
+git clone <https://github.com/hidingbehindrainbows/Image-Search-Engine.git>
 ```
 
 ### 2. Backend Setup
@@ -156,10 +155,6 @@ The search algorithm uses a combination of:
 3. Commit your changes
 4. Push to the branch
 5. Create a Pull Request
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
 
 ## Environment Setup
 
